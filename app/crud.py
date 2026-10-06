@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime
 from typing import Any
 
 from . import timeutil
@@ -535,3 +536,85 @@ def get_report(sample_id: str, report_id: int) -> dict[str, Any]:
         if not row:
             raise NotFoundError(f"report {report_id} of sample {sample_id} not found")
         return json.loads(row["snapshot_json"])
+
+
+# ---------------------------------------------------------------- 合规汇总
+
+def compliance_summary(
+    partition_code: str, start_at: datetime, end_at: datetime
+) -> dict[str, Any]:
+    """按分区 + 采样时刻左闭右开窗口 [start_at, end_at) 汇总已发布报告。
+
+    - 起止时刻必须带时区（归一化 UTC）；start_at >= end_at -> 422 invalid_time_range。
+    - 分区不存在 -> 404 partition_not_found。
+    - 窗口内每个样本只采用其最新（reading_version 最大）已发布报告；未发布样本不计入。
+    - 返回报告样本总数、合格/不合格数，以及按指标统计的超限次数
+      （指标在某份被采用的快照中出现违规即计一次）。
+    - 无报告时各计数为 0；按指标次数以该分区当前必测指标清单给出零基线。
+    """
+    if start_at.tzinfo is None or end_at.tzinfo is None:
+        raise UnprocessableError(
+            "start_at and end_at must be timezone-aware, e.g. 2025-06-01T08:00:00+08:00",
+            code="invalid_time_range",
+        )
+    start_utc = timeutil.to_utc(start_at)
+    end_utc = timeutil.to_utc(end_at)
+    if start_utc >= end_utc:
+        raise UnprocessableError(
+            "start_at must be strictly earlier than end_at (half-open [start_at, end_at))",
+            code="invalid_time_range",
+            details={"start_at": timeutil.iso_z(start_utc), "end_at": timeutil.iso_z(end_utc)},
+        )
+    start_ms, end_ms = timeutil.epoch_ms(start_utc), timeutil.epoch_ms(end_utc)
+
+    with read_tx() as conn:
+        if not conn.execute("SELECT 1 FROM partitions WHERE code=?", (partition_code,)).fetchone():
+            raise NotFoundError(
+                f"partition {partition_code!r} not found", code="partition_not_found"
+            )
+
+        mandatory = [
+            r["indicator_code"]
+            for r in conn.execute(
+                "SELECT indicator_code FROM mandatory_indicators WHERE partition_code=? ORDER BY indicator_code",
+                (partition_code,),
+            )
+        ]
+
+        # 每个样本只取其最新已发布报告（reading_version 最大），
+        # 再按采样时刻的左闭右开窗口筛样本。
+        rows = conn.execute(
+            """
+            SELECT r.snapshot_json AS snapshot_json
+            FROM samples s
+            JOIN reports r ON r.sample_id = s.id
+            WHERE s.partition_code = ?
+              AND s.sampled_at_ms >= ? AND s.sampled_at_ms < ?
+              AND r.reading_version = (
+                  SELECT MAX(r2.reading_version) FROM reports r2 WHERE r2.sample_id = s.id
+              )
+            """,
+            (partition_code, start_ms, end_ms),
+        ).fetchall()
+
+    total = 0
+    qualified = 0
+    violations_by_indicator: dict[str, int] = {code: 0 for code in mandatory}
+    for row in rows:
+        snapshot = json.loads(row["snapshot_json"])
+        total += 1
+        if snapshot.get("conclusion") == "qualified":
+            qualified += 1
+        for item in snapshot.get("violations", []):
+            code = item["indicator_code"]
+            violations_by_indicator[code] = violations_by_indicator.get(code, 0) + 1
+
+    return {
+        "partition_code": partition_code,
+        "start_at": timeutil.iso_z(start_utc),
+        "end_at": timeutil.iso_z(end_utc),
+        "total_reported_samples": total,
+        "qualified_count": qualified,
+        "unqualified_count": total - qualified,
+        "indicator_violations": dict(sorted(violations_by_indicator.items())),
+    }

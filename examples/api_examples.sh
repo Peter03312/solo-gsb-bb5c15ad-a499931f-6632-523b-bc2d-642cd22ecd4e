@@ -125,5 +125,31 @@ curl -sS -o /tmp/p3.json -w 'HTTP %{http_code}\n' -X POST "$BASE/samples/$NOLIM/
   -H 'Content-Type: application/json' -d '{"expected_version":3}'
 cat /tmp/p3.json | python3 -m json.tool
 
+say "11. 合规汇总：按分区 + 采样时刻窗口（左闭右开）统计已发布报告"
+echo "  窗口 [2025-01-01Z, 2026-01-01Z) 内每个样本只取最新已发布报告；未发布样本不计入"
+curl -sS --get "$BASE/partitions/P1/compliance-summary" \
+  --data-urlencode "start_at=2025-01-01T00:00:00Z" \
+  --data-urlencode "end_at=2026-01-01T00:00:00Z" | python3 -m json.tool
+
+say "11b. 起止时刻可带时区偏移（与上面同一 UTC 窗口，结果相同）"
+curl -sS --get "$BASE/partitions/P1/compliance-summary" \
+  --data-urlencode "start_at=2025-01-01T08:00:00+08:00" \
+  --data-urlencode "end_at=2026-01-01T08:00:00+08:00" | python3 -m json.tool
+
+say "11c. 无报告窗口（2024 年）：各计数为零，按指标给零基线"
+curl -sS --get "$BASE/partitions/P1/compliance-summary" \
+  --data-urlencode "start_at=2024-01-01T00:00:00Z" \
+  --data-urlencode "end_at=2025-01-01T00:00:00Z" | python3 -m json.tool
+
+say "11d. 起点不早于终点 -> 422 invalid_time_range（统一错误信封）"
+curl -sS -w '\nHTTP %{http_code}\n' --get "$BASE/partitions/P1/compliance-summary" \
+  --data-urlencode "start_at=2026-01-01T00:00:00Z" \
+  --data-urlencode "end_at=2025-01-01T00:00:00Z"
+
+say "11e. 分区不存在 -> 404 partition_not_found（统一错误信封）"
+curl -sS -w '\nHTTP %{http_code}\n' --get "$BASE/partitions/NOPE/compliance-summary" \
+  --data-urlencode "start_at=2025-01-01T00:00:00Z" \
+  --data-urlencode "end_at=2026-01-01T00:00:00Z"
+
 echo
 echo "DONE. 可交互式查看 OpenAPI 文档： $BASE/docs"

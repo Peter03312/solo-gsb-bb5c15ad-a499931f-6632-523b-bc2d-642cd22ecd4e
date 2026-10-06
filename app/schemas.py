@@ -6,13 +6,17 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from .timeutil import to_utc
 
 _NON_EMPTY = Field(min_length=1, max_length=64)
 _REQUEST_NO = Field(min_length=1, max_length=128)
+
+# 查询参数用：必须带时区，归一化为 UTC；无时区 -> 422 validation_error
+AwareDatetime = Annotated[datetime, AfterValidator(to_utc)]
 
 
 class StrictModel(BaseModel):

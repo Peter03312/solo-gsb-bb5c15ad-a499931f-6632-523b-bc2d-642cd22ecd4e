@@ -4,7 +4,8 @@
 流程覆盖：
   登记样本 -> 录入读数 -> 版本冲突 -> 更正(请求号/重放/同号异内容)
   -> 首次发布(不合格快照) -> 重复发布拒绝 -> 更正后再发布(新版本合格, 旧版可查)
-  -> 读数不齐/无生效限值门禁。
+  -> 读数不齐/无生效限值门禁
+  -> 按分区 + 采样时刻窗口的合规汇总（左闭右开、仅最新已发布报告、按指标超限次数）。
 
 用法：
     python examples/demo_client.py            # 默认 http://localhost:8080
@@ -16,9 +17,14 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE = os.environ.get("BASE", "http://localhost:8080").rstrip("/")
+
+# 每次运行使用唯一请求号前缀，保证脚本对同一服务重复运行不会撞到历史幂等记录
+RUN_TAG = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
 
 
 def call(method: str, path: str, body: dict | None = None):
@@ -45,6 +51,23 @@ def expect(status: int, got: int, label: str) -> None:
     print(f"  [{flag}] {label}: HTTP {got} (expect {status})")
     if got != status:
         sys.exit(1)
+
+
+def iso(dt: datetime) -> str:
+    """UTC datetime -> '2025-06-01T00:00:00Z'。"""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def publish_complete(sid: str, values: dict[str, float]) -> None:
+    """从版本 0 顺序录入三项读数并发布（演示辅助）。"""
+    version = 0
+    for indicator, value in values.items():
+        s, _ = call("PUT", f"/samples/{sid}/readings/{indicator}",
+                    {"indicator_code": indicator, "value": value, "expected_version": version})
+        assert s == 200, (s, indicator)
+        version += 1
+    s, _ = call("POST", f"/samples/{sid}/publish", {"expected_version": version})
+    assert s == 201, s
 
 
 def main() -> None:
@@ -80,9 +103,9 @@ def main() -> None:
     expect(422, s, "correction without request_no")
     print("  code:", r["error"]["code"])
 
-    step("带唯一请求号 REQ-42 更正浑浊度 -> 版本 +1")
+    step("带唯一请求号更正浑浊度 -> 版本 +1")
     payload = {"indicator_code": "turbidity", "value": 0.5,
-               "expected_version": version, "request_no": "REQ-42"}
+               "expected_version": version, "request_no": f"REQ-42-{RUN_TAG}"}
     s, first = call("PUT", f"/samples/{sid}/readings/turbidity", payload)
     expect(200, s, "correction")
     print("  ", first)
@@ -118,7 +141,7 @@ def main() -> None:
     step("再更正为超限值 1.0（max 开端，等于上限即超限）并发布 -> 新版本不合格")
     s, corr = call("PUT", f"/samples/{sid}/readings/turbidity",
                    {"indicator_code": "turbidity", "value": 1.0,
-                    "expected_version": version, "request_no": "REQ-43"})
+                    "expected_version": version, "request_no": f"REQ-43-{RUN_TAG}"})
     expect(200, s, "second correction")
     version = corr["reading_version"]
     s, report2 = call("POST", f"/samples/{sid}/publish", {"expected_version": version})
@@ -163,7 +186,108 @@ def main() -> None:
     s, r = call("POST", "/admin/partitions/P2/limits",
                 {"indicator_code": "residual_chlorine", "min_value": 0.03, "max_value": 4.0,
                  "valid_from": "2026-01-01T00:00:00Z", "valid_to": "2027-01-01T00:00:00Z"})
-    expect(201, s, "adjacent interval accepted")
+    # 首次运行 201；对同一服务重复运行时该限值已存在 -> 422（重叠），同样说明规则生效
+    assert s in (201, 422), s
+    print(f"  [OK ] adjacent interval: HTTP {s} (201 created / 422 already exists on rerun)")
+
+    # -------------------------------------------------------- 合规汇总
+    # 每次运行使用独立分区（分区码含运行时间戳），汇总结果不受历史运行数据影响
+    pcode = "PD" + datetime.now(timezone.utc).strftime("%H%M%S%f")[:12]
+    step(f"合规汇总准备：本次运行专用分区 {pcode}（含 3 项必测指标与宽时限值）")
+    for method, path, body in [
+        ("POST", "/admin/partitions", {"code": pcode, "name": "汇总演示分区"}),
+        (f"POST", f"/admin/partitions/{pcode}/mandatory-indicators", {"indicator_code": "turbidity"}),
+        ("POST", f"/admin/partitions/{pcode}/mandatory-indicators", {"indicator_code": "ph"}),
+        ("POST", f"/admin/partitions/{pcode}/mandatory-indicators",
+         {"indicator_code": "residual_chlorine"}),
+    ]:
+        s, r = call(method, path, body)
+        assert s == 201, (s, r)
+    for indicator, mn, mx in [
+        ("turbidity", None, 1.0),
+        ("ph", 6.5, 8.5),
+        ("residual_chlorine", None, 4.0),
+    ]:
+        s, r = call("POST", f"/admin/partitions/{pcode}/limits",
+                    {"indicator_code": indicator, "min_value": mn, "max_value": mx,
+                     "valid_from": "2020-01-01T00:00:00Z", "valid_to": "2030-01-01T00:00:00Z"})
+        assert s == 201, (s, r)
+    print("  partition ready (3 mandatory indicators, one wide limit each)")
+
+    # 以当前 UTC 时间锚定一个 [anchor, anchor+1h) 的窗口
+    anchor = datetime.now(timezone.utc).replace(microsecond=0)
+    win_from, win_to = anchor, anchor + timedelta(hours=1)
+
+    def register_publish(offset_min: int, values: dict[str, float]):
+        s, sample = call("POST", "/samples",
+                         {"partition_code": pcode,
+                          "sampled_at": iso(anchor + timedelta(minutes=offset_min))})
+        assert s == 201, (s, sample)
+        publish_complete(sample["id"], values)
+        return sample["id"]
+
+    step("窗口内造数：合格 1 + 不合格 1（ph 超限）+ 边界外 1 + 窗口内未发布 1")
+    register_publish(5, {"turbidity": 0.2, "ph": 7.2, "residual_chlorine": 0.8})
+    sid_bad = register_publish(10, {"turbidity": 0.4, "ph": 9.0, "residual_chlorine": 0.8})
+    register_publish(65, {"turbidity": 0.2, "ph": 7.2, "residual_chlorine": 0.8})  # == 窗口终点，排除
+    s, unpublished = call("POST", "/samples",
+                          {"partition_code": pcode, "sampled_at": iso(anchor + timedelta(minutes=20))})
+    assert s == 201
+
+    step("汇总查询（未发布不计入；窗口左闭右开）-> total=2 / 合格1 / 不合格1 / ph 超限1")
+    qs = urllib.parse.urlencode({"start_at": iso(win_from), "end_at": iso(win_to)})
+    s, summary = call("GET", f"/partitions/{pcode}/compliance-summary?{qs}")
+    expect(200, s, "summary")
+    print(" ", json.dumps(summary, ensure_ascii=False))
+    assert summary["partition_code"] == pcode
+    assert summary["total_reported_samples"] == 2
+    assert summary["qualified_count"] == 1 and summary["unqualified_count"] == 1
+    assert summary["indicator_violations"]["ph"] == 1
+    assert summary["indicator_violations"]["turbidity"] == 0
+
+    step("仅最新已发布报告计入：更正 ph 并重新发布为合格 -> 汇总变为 2 份全部合格")
+    s, corr = call("PUT", f"/samples/{sid_bad}/readings/ph",
+                   {"indicator_code": "ph", "value": 7.0,
+                    "expected_version": 3, "request_no": f"DEMO-FIX-{anchor.strftime('%H%M%S')}"})
+    expect(200, s, "correction")
+    s, _ = call("POST", f"/samples/{sid_bad}/publish",
+                {"expected_version": corr["reading_version"]})
+    expect(201, s, "republish")
+    s, summary = call("GET", f"/partitions/{pcode}/compliance-summary?{qs}")
+    assert s == 200
+    print(" ", json.dumps(summary, ensure_ascii=False))
+    assert summary["total_reported_samples"] == 2
+    assert summary["qualified_count"] == 2 and summary["unqualified_count"] == 0
+    assert all(v == 0 for v in summary["indicator_violations"].values())
+
+    step("无报告窗口：各计数为零，按必测指标给零基线")
+    empty_qs = urllib.parse.urlencode({
+        "start_at": "2024-01-01T00:00:00Z", "end_at": "2024-02-01T00:00:00Z"})
+    s, summary = call("GET", f"/partitions/{pcode}/compliance-summary?{empty_qs}")
+    expect(200, s, "empty window")
+    print(" ", summary)
+    assert summary["total_reported_samples"] == 0
+    assert summary["indicator_violations"] == {
+        "ph": 0, "residual_chlorine": 0, "turbidity": 0}
+
+    step("汇总错误：start_at 不早于 end_at -> 422 invalid_time_range")
+    bad_qs = urllib.parse.urlencode({
+        "start_at": iso(win_to), "end_at": iso(win_from)})
+    s, r = call("GET", f"/partitions/{pcode}/compliance-summary?{bad_qs}")
+    expect(422, s, "invalid range")
+    print("  code:", r["error"]["code"])
+
+    step("汇总错误：时间不带时区 -> 422 validation_error")
+    naive_qs = urllib.parse.urlencode({
+        "start_at": "2025-06-01T08:00:00", "end_at": iso(win_to)})
+    s, r = call("GET", f"/partitions/{pcode}/compliance-summary?{naive_qs}")
+    expect(422, s, "naive datetime")
+    print("  code:", r["error"]["code"])
+
+    step("汇总错误：分区不存在 -> 404 partition_not_found")
+    s, r = call("GET", f"/partitions/NOPE/compliance-summary?{qs}")
+    expect(404, s, "partition missing")
+    print("  code:", r["error"]["code"])
 
     print("\nALL DEMO STEPS PASSED")
 
