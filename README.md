@@ -5,7 +5,8 @@ Python 3.11 + FastAPI + SQLite 实现。维护各供水分区的**必测指标**
 对非负读数做乐观锁录入/更正（更正请求号幂等）；读数齐全且每项指标在采样时刻
 **恰有一条**生效限值时方可发布，**任一超限即不合格**。发布保存读数、限值依据与
 结论快照；同一读数版本不得重复发布，更正后再发布产生**新版本报告**且旧版保留可查；
-发布事务化，并发发布只准一个成功、失败不留部分报告。
+发布事务化，并发发布只准一个成功、失败不留部分报告。另支持**按分区与采样时间范围
+（左闭右开）汇总**：每样本只取最新已发布报告，统计合格/不合格数与分指标超限次数。
 
 ---
 
@@ -119,6 +120,7 @@ Compose 中通过 `ports: "8080:8080"` 映射宿主机端口；改为如 `"18080
 | POST | `/samples/{sample}/publish` | 发布合规报告 `{expected_version}` |
 | GET | `/samples/{sample}/reports` | 报告版本列表 |
 | GET | `/samples/{sample}/reports/{report_id}` | 报告快照（读数+限值依据+结论） |
+| GET | `/compliance/summary` | **按分区 + 采样时间范围汇总合规情况**，见下 |
 
 读数请求体：
 
@@ -180,15 +182,62 @@ Compose 中通过 `ports: "8080:8080"` 映射宿主机端口；改为如 `"18080
 }
 ```
 
+### 合规汇总查询
+
+`GET /compliance/summary?partition=P1&start=2025-01-01T00:00:00Z&end=2026-01-01T00:00:00Z`
+
+- 查询参数：`partition`（分区编码）、`start` / `end`（采样时刻范围，**必须带时区**，
+  接受 `Z` 或 `+08:00` 偏移；服务端归一化为 UTC）。
+- 样本筛选条件为采样时刻落在**左闭右开**区间 `start <= sampled_at < end`。
+- 区间内每个样本**只采用最新一条已发布报告**（读数版本最大者；更正后重发布的旧版本
+  不参与汇总）；**从未发布过报告的样本不计入**。
+- 返回字段：
+  - `report_samples_total`：计入汇总的报告样本总数（每样本至多 1 条）；
+  - `qualified_count` / `unqualified_count`：最新报告结论为合格 / 不合格的样本数；
+  - `indicator_violation_counts`：按指标统计的超限次数（遍历每份最新报告的违规项计数；
+    同一报告内同一指标至多计 1 次）；对该分区全部必测指标补零。
+- 区间内**无报告（含无样本、有样本但未发布）时，上述计数全部为 0**。
+- 错误（统一错误信封）：
+  - `start >= end`（含相等）→ `422 invalid_time_range`；
+  - 分区不存在 → `404 partition_not_found`；
+  - 时刻不带时区 → `422 timezone_required`；无法解析 → `422 invalid_datetime`。
+
+响应示例：
+
+```json
+{
+  "partition_code": "P1",
+  "start": "2025-01-01T00:00:00Z",
+  "end": "2026-01-01T00:00:00Z",
+  "report_samples_total": 3,
+  "qualified_count": 2,
+  "unqualified_count": 1,
+  "indicator_violation_counts": {
+    "ph": 0,
+    "residual_chlorine": 0,
+    "turbidity": 1
+  }
+}
+```
+
+curl 调用示例：
+
+```bash
+curl -G http://localhost:8080/compliance/summary \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2025-01-01T08:00:00+08:00" \
+  --data-urlencode "end=2026-01-01T00:00:00Z"
+```
+
 ## 5. 调用示例
 
 服务启动后任选其一：
 
 ```bash
-# curl 版（仅依赖 bash/curl/python3 解析 JSON），覆盖全部正常与拒绝路径
+# curl 版（仅依赖 bash/curl/python3 解析 JSON），覆盖全部正常与拒绝路径（含合规汇总）
 bash examples/api_examples.sh
 
-# Python 版（仅标准库，自带断言，无需安装第三方包）
+# Python 版（仅标准库，自带断言，无需安装第三方包；汇总部分使用本次运行专用分区）
 python examples/demo_client.py
 
 # 指定地址
@@ -202,10 +251,11 @@ pip install pytest httpx
 pytest -q
 ```
 
-22 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
+33 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
 更正请求号缺失/重放/同号异内容、读数不齐、无生效限值、左闭右开边界、
 min 闭/max 开判定、重复发布、更正后新旧版本并存、5 线程并发发布仅一个成功、
-发布失败不留报告。
+发布失败不留报告；以及合规汇总的最新报告取值、未发布排除、左右开闭边界、
+时区偏移归一、空窗口补零、非法范围/未知分区/裸时间错误。
 
 ## 7. 项目结构
 
@@ -221,6 +271,7 @@ app/
   main.py              # FastAPI 入口、异常处理、lifespan 初始化
   routers/admin.py     # 主数据管理接口
   routers/samples.py   # 样本/读数/发布接口
+  routers/summary.py   # 分区+时间范围合规汇总查询接口
 scripts/init_db.py     # 手工初始化脚本
 examples/              # curl 与 Python 调用示例
 tests/                 # pytest 端到端用例
@@ -241,3 +292,7 @@ requirements.txt
   报告以读数版本为业务版本，形成可查询、不可变的历史序列。
 - **幂等**：更正请求指纹 = `(sample_id, indicator_code, value, expected_version)`
   的规范 JSON，与请求号一起落库；重放返回缓存的原始响应。
+- **汇总**：范围查询走只读快照事务，用 `samples(partition_code, sampled_at_ms)`
+  复合索引做左闭右开过滤；每样本以相关子查询 `MAX(reports.id)` 取最新已发布报告
+  （id 随读数版本单调递增），未发布样本自然不命中；合格/不合格数与分指标超限次数
+  直接基于最新报告快照累加，无报告时对必测指标补零。

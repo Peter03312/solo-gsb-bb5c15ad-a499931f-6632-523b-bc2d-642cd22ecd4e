@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -80,9 +81,10 @@ def main() -> None:
     expect(422, s, "correction without request_no")
     print("  code:", r["error"]["code"])
 
-    step("带唯一请求号 REQ-42 更正浑浊度 -> 版本 +1")
+    step("带唯一请求号更正浑浊度 -> 版本 +1")
+    req_fix1 = f"REQ-FIX-{int(time.time())}-1"
     payload = {"indicator_code": "turbidity", "value": 0.5,
-               "expected_version": version, "request_no": "REQ-42"}
+               "expected_version": version, "request_no": req_fix1}
     s, first = call("PUT", f"/samples/{sid}/readings/turbidity", payload)
     expect(200, s, "correction")
     print("  ", first)
@@ -118,7 +120,7 @@ def main() -> None:
     step("再更正为超限值 1.0（max 开端，等于上限即超限）并发布 -> 新版本不合格")
     s, corr = call("PUT", f"/samples/{sid}/readings/turbidity",
                    {"indicator_code": "turbidity", "value": 1.0,
-                    "expected_version": version, "request_no": "REQ-43"})
+                    "expected_version": version, "request_no": req_fix1 + "-B"})
     expect(200, s, "second correction")
     version = corr["reading_version"]
     s, report2 = call("POST", f"/samples/{sid}/publish", {"expected_version": version})
@@ -164,6 +166,72 @@ def main() -> None:
                 {"indicator_code": "residual_chlorine", "min_value": 0.03, "max_value": 4.0,
                  "valid_from": "2026-01-01T00:00:00Z", "valid_to": "2027-01-01T00:00:00Z"})
     expect(201, s, "adjacent interval accepted")
+
+    step("合规汇总：本次运行专用分区，窗口内 合格1 / 不合格1 / 未发布1")
+    pcode = f"PD{int(time.time())}"
+    call("POST", "/admin/partitions", {"code": pcode, "name": "汇总演示分区"})
+    call("POST", f"/admin/partitions/{pcode}/mandatory-indicators", {"indicator_code": "ph"})
+    call("POST", f"/admin/partitions/{pcode}/limits",
+         {"indicator_code": "ph", "min_value": 6.5, "max_value": 8.5,
+          "valid_from": "2025-01-01T00:00:00Z", "valid_to": "2026-01-01T00:00:00Z"})
+    # 合格样本
+    _, s_ok = call("POST", "/samples",
+                   {"partition_code": pcode, "sampled_at": "2025-06-10T00:00:00Z"})
+    call("PUT", f"/samples/{s_ok['id']}/readings/ph",
+         {"indicator_code": "ph", "value": 7.2, "expected_version": 0})
+    call("POST", f"/samples/{s_ok['id']}/publish", {"expected_version": 1})
+    # 不合格样本（pH 8.5 为开端，等于上限即超限）
+    _, s_bad = call("POST", "/samples",
+                    {"partition_code": pcode, "sampled_at": "2025-06-20T00:00:00Z"})
+    call("PUT", f"/samples/{s_bad['id']}/readings/ph",
+         {"indicator_code": "ph", "value": 8.5, "expected_version": 0})
+    call("POST", f"/samples/{s_bad['id']}/publish", {"expected_version": 1})
+    # 未发布样本（不计入）
+    call("POST", "/samples", {"partition_code": pcode, "sampled_at": "2025-06-25T00:00:00Z"})
+
+    query = (f"/compliance/summary?partition={pcode}"
+             "&start=2025-01-01T00:00:00Z&end=2026-01-01T00:00:00Z")
+    s, summary = call("GET", query)
+    expect(200, s, "compliance summary")
+    print(" ", summary)
+    assert summary["report_samples_total"] == 2
+    assert summary["qualified_count"] == 1
+    assert summary["unqualified_count"] == 1
+    assert summary["indicator_violation_counts"] == {"ph": 1}
+
+    step("汇总：起点带 +08:00 偏移（等价 2025-06-10T00:00:00Z，左闭包含 06-10）")
+    s, summary2 = call("GET", f"/compliance/summary?partition={pcode}"
+                              "&start=2025-06-10T08:00:00%2B08:00&end=2025-06-20T00:00:00Z")
+    expect(200, s, "offset window")
+    assert summary2["start"] == "2025-06-10T00:00:00Z"
+    assert summary2["report_samples_total"] == 1 and summary2["qualified_count"] == 1
+    print(" ", summary2)
+
+    step("汇总：空窗口（右开端点排除 06-20；06-11 起）-> 各计数为零")
+    s, empty = call("GET", f"/compliance/summary?partition={pcode}"
+                           "&start=2025-06-11T00:00:00Z&end=2025-06-20T00:00:00Z")
+    expect(200, s, "empty window")
+    assert (empty["report_samples_total"], empty["qualified_count"],
+            empty["unqualified_count"], empty["indicator_violation_counts"]) == (0, 0, 0, {"ph": 0})
+    print(" ", empty)
+
+    step("汇总错误：起点不早于终点 -> 422 invalid_time_range")
+    s, r = call("GET", f"/compliance/summary?partition={pcode}"
+                       "&start=2025-07-01T00:00:00Z&end=2025-01-01T00:00:00Z")
+    expect(422, s, "invalid range")
+    print("  code:", r["error"]["code"])
+
+    step("汇总错误：分区不存在 -> 404 partition_not_found")
+    s, r = call("GET", "/compliance/summary?partition=NOPE"
+                       "&start=2025-01-01T00:00:00Z&end=2026-01-01T00:00:00Z")
+    expect(404, s, "partition not found")
+    print("  code:", r["error"]["code"])
+
+    step("汇总错误：时刻不带时区 -> 422 timezone_required")
+    s, r = call("GET", f"/compliance/summary?partition={pcode}"
+                       "&start=2025-01-01T00:00:00&end=2026-01-01T00:00:00Z")
+    expect(422, s, "naive datetime")
+    print("  code:", r["error"]["code"])
 
     print("\nALL DEMO STEPS PASSED")
 

@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from . import seed
 from .config import settings
 from .errors import ApiError
-from .routers import admin, samples
+from .routers import admin, samples, summary
 
 
 @asynccontextmanager
@@ -79,6 +79,7 @@ def health():
 
 app.include_router(admin.router)
 app.include_router(samples.router)
+app.include_router(summary.router)
 
 
 if __name__ == "__main__":

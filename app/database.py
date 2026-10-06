@@ -99,6 +99,7 @@ CREATE INDEX IF NOT EXISTS idx_limits_lookup
     ON limits (partition_code, indicator_code, valid_from_ms, valid_to_ms);
 CREATE INDEX IF NOT EXISTS idx_reports_sample ON reports (sample_id, id);
 CREATE INDEX IF NOT EXISTS idx_samples_partition ON samples (partition_code);
+CREATE INDEX IF NOT EXISTS idx_samples_partition_time ON samples (partition_code, sampled_at_ms);
 """
 
 

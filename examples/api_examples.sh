@@ -125,5 +125,45 @@ curl -sS -o /tmp/p3.json -w 'HTTP %{http_code}\n' -X POST "$BASE/samples/$NOLIM/
   -H 'Content-Type: application/json' -d '{"expected_version":3}'
 cat /tmp/p3.json | python3 -m json.tool
 
+say "11. 合规汇总：按分区 + 采样时刻左闭右开区间统计最新已发布报告"
+# 上面 SID 在 2025 窗口内已有一版合格报告（v5）；BAD/NOLIM 从未发布，不计入
+curl -sS -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2025-01-01T00:00:00Z" \
+  --data-urlencode "end=2026-01-01T00:00:00Z" | python3 -m json.tool
+
+say "11b. 汇总：时区偏移起点（+08:00 与 Z 等价归一）"
+curl -sS -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2025-01-01T08:00:00+08:00" \
+  --data-urlencode "end=2026-01-01T00:00:00Z" | python3 -m json.tool
+
+say "11c. 汇总：右开端点，恰为 2026-01-01 采样的样本被排除 -> 各计数为零"
+curl -sS -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2026-01-01T00:00:00Z" \
+  --data-urlencode "end=2027-01-01T00:00:00Z" | python3 -m json.tool
+
+say "11d. 汇总错误：起点不早于终点 -> 422 invalid_time_range"
+curl -sS -o /tmp/s1.json -w 'HTTP %{http_code}\n' -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2025-07-01T00:00:00Z" \
+  --data-urlencode "end=2025-01-01T00:00:00Z"
+cat /tmp/s1.json | python3 -m json.tool
+
+say "11e. 汇总错误：分区不存在 -> 404 partition_not_found"
+curl -sS -o /tmp/s2.json -w 'HTTP %{http_code}\n' -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=NOPE" \
+  --data-urlencode "start=2025-01-01T00:00:00Z" \
+  --data-urlencode "end=2026-01-01T00:00:00Z"
+cat /tmp/s2.json | python3 -m json.tool
+
+say "11f. 汇总错误：时刻不带时区 -> 422 timezone_required"
+curl -sS -o /tmp/s3.json -w 'HTTP %{http_code}\n' -G "$BASE/compliance/summary" \
+  --data-urlencode "partition=P1" \
+  --data-urlencode "start=2025-01-01T00:00:00" \
+  --data-urlencode "end=2026-01-01T00:00:00Z"
+cat /tmp/s3.json | python3 -m json.tool
+
 echo
 echo "DONE. 可交互式查看 OpenAPI 文档： $BASE/docs"

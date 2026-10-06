@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from . import timeutil
@@ -535,3 +536,74 @@ def get_report(sample_id: str, report_id: int) -> dict[str, Any]:
         if not row:
             raise NotFoundError(f"report {report_id} of sample {sample_id} not found")
         return json.loads(row["snapshot_json"])
+
+
+# ---------------------------------------------------------------- 合规汇总
+
+def compliance_summary(
+    partition_code: str, start_ms: int, end_ms: int
+) -> dict[str, Any]:
+    """按分区 + 采样时刻左闭右开区间 [start_ms, end_ms) 汇总合规情况。
+
+    - 区间内每个样本只取其**最新一条已发布报告**（reading_version 最大，即 id 最大）；
+    - 从未发布过报告的样本不计入总数；
+    - 无报告/无样本时各计数为零，指标超限次数对该分区全部必测指标补 0。
+    """
+    with read_tx() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM partitions WHERE code=?", (partition_code,)
+        ).fetchone():
+            raise NotFoundError(
+                f"partition {partition_code!r} not found", code="partition_not_found"
+            )
+
+        mandatory = [
+            r["indicator_code"]
+            for r in conn.execute(
+                "SELECT indicator_code FROM mandatory_indicators WHERE partition_code=? ORDER BY indicator_code",
+                (partition_code,),
+            )
+        ]
+        # 必测指标全部补 0：无报告时各指标超限次数也为 0
+        violations_by_indicator: dict[str, int] = {code: 0 for code in mandatory}
+
+        # 区间内每个样本的最新报告：reports.id 自增且随 reading_version 单调，
+        # 取每样本 MAX(r.id) 即“最新已发布报告”
+        rows = conn.execute(
+            """
+            SELECT r.snapshot_json
+              FROM reports r
+              JOIN samples s ON s.id = r.sample_id
+             WHERE s.partition_code = ?
+               AND s.sampled_at_ms >= ?
+               AND s.sampled_at_ms < ?
+               AND r.id = (
+                     SELECT MAX(r2.id) FROM reports r2 WHERE r2.sample_id = s.id
+               )
+            """,
+            (partition_code, start_ms, end_ms),
+        ).fetchall()
+
+        qualified_count = 0
+        unqualified_count = 0
+        for row in rows:
+            snapshot = json.loads(row["snapshot_json"])
+            if snapshot.get("qualified"):
+                qualified_count += 1
+            else:
+                unqualified_count += 1
+            for v in snapshot.get("violations", []):
+                code = v["indicator_code"]
+                # 快照里的指标理应都是必测项；防御性处理（如必测关系被移除）
+                violations_by_indicator[code] = violations_by_indicator.get(code, 0) + 1
+
+        report_count = qualified_count + unqualified_count
+        return {
+            "partition_code": partition_code,
+            "start": timeutil.iso_z(datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)),
+            "end": timeutil.iso_z(datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)),
+            "report_samples_total": report_count,
+            "qualified_count": qualified_count,
+            "unqualified_count": unqualified_count,
+            "indicator_violation_counts": violations_by_indicator,
+        }
